@@ -30,7 +30,7 @@ def forward_process(input_ids, eps=1e-3):
     # 126336 is used for [MASK] token
     noisy_batch = torch.where(masked_indices, 126336, input_ids)
     return noisy_batch, masked_indices, p_mask
-def compute_loss(input_ids, model,prompt_length,answer_length):
+def compute_loss(input_ids, model,prompt_length):
     noisy_batch, masked_indices, p_mask = forward_process(input_ids)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
@@ -61,12 +61,14 @@ def prepare(args):
     model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).to(accelerator.device).train()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     dataset= preprocess_gsm8k(tokenizer,args.max_length)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True,drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,drop_last=True)
     for param in model.parameters():
         param.requires_grad = True
         param.to(torch.float32)
     train_parameters=[param for param in model.parameters() if param.requires_grad]
     optimizer = AdamW(train_parameters, lr=args.lr,)
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = (args.batch_size)
     model,optimizer=accelerator.prepare(model,optimizer)
     return model, tokenizer, dataloader,accelerator,optimizer
 
@@ -105,7 +107,7 @@ def main():
             #     random_length = torch.randint(1, input_ids.shape[1] + 1, (1,))
             #     input_ids = input_ids[:, :random_length]
             with accelerator.accumulate(model):
-                loss = compute_loss(input_ids, model)
+                loss = compute_loss(input_ids, model,prompt_length)
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:

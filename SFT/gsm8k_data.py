@@ -17,10 +17,14 @@ class CustomDataset(Dataset):
 
 def preprocess_gsm8k(tokenizer, max_length=2048):
     train_dataset = []
-    ds = load_dataset("openai/gsm8k", "main")
-    data = []
+    data=[]
+    ds = load_dataset("openai/gsm8k", "main")["train"]
+    for d in ds:
+        all=d["question"]+"||"+d["answer"]
+        data.append(all)
+        # print(all)
     # file_path = 'data/gsm8k/train.txt'
-    d
+    
     for i in range(len(data)):
         d = data[i]
 
