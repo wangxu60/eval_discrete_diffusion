@@ -20,7 +20,7 @@ class  TextDataset(Dataset):
     def __getitem__(self, idx):
         return {"text": self.examples[idx]}
     
-def forward_process(input_ids, eps=1e-3):
+def forward_process(input_ids, eps=1e-3,mask_id=126336):
     b, l = input_ids.shape
     t = torch.rand(b, device=input_ids.device)
     p_mask = (1 - eps) * t + eps
@@ -28,9 +28,9 @@ def forward_process(input_ids, eps=1e-3):
 
     masked_indices = torch.rand((b, l), device=input_ids.device) < p_mask
     # 126336 is used for [MASK] token
-    noisy_batch = torch.where(masked_indices, 126336, input_ids)
+    noisy_batch = torch.where(masked_indices, mask_id, input_ids)
     return noisy_batch, masked_indices, p_mask
-def compute_loss(input_ids, model,prompt_length):
+def compute_loss(input_ids, model,prompt_length,mask_id=126336):
     noisy_batch, masked_indices, p_mask = forward_process(input_ids)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
@@ -40,13 +40,15 @@ def compute_loss(input_ids, model,prompt_length):
 # Calculate the answer length (including the padded <EOS> tokens)
     prompt_mask = prompt_mask.to(torch.int64)    
     answer_lengths = torch.sum((1 - prompt_mask), dim=-1, keepdim=True)
-    answer_lengths = answer_length.repeat(1, noisy_batch.shape[1])    
+    answer_lengths = answer_lengths.repeat(1, noisy_batch.shape[1])    
 
-    masked_indices = (noisy_batch == 126336)
-
+    masked_indices = (noisy_batch == mask_id)
+    noisy_batch=noisy_batch.to(model.device)
     logits = model(input_ids=noisy_batch).logits
-        
+    input_ids=input_ids.to(model.device)
+    p_mask=p_mask.to(model.device)
     token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none') / p_mask[masked_indices]
+    answer_lengths=answer_lengths.to(model.device)
     ce_loss = torch.sum(token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
     # logits = model(input_ids=noisy_batch).logits
     # token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none') / p_mask[masked_indices]
@@ -111,7 +113,7 @@ def main():
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                accelerator.clip_grad_norm_(model.parameters(),1.0)
             optimizer.step()
             optimizer.zero_grad()
             if accelerator.sync_gradients:
@@ -122,6 +124,7 @@ def main():
                         output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                         os.makedirs(output_dir,exist_ok=True)
             if global_step%args.save_steps==0:
+                output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                 accelerator.save_state(output_dir)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
