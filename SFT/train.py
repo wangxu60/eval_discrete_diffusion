@@ -31,7 +31,7 @@ def forward_process(input_ids, eps=1e-3,mask_id=126336):
     noisy_batch = torch.where(masked_indices, mask_id, input_ids)
     return noisy_batch, masked_indices, p_mask
 def compute_loss(input_ids, model,prompt_length,mask_id=126336):
-    noisy_batch, masked_indices, p_mask = forward_process(input_ids)
+    noisy_batch, masked_indices, p_mask = forward_process(input_ids,mask_id=mask_id)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     prompt_mask = (token_positions < prompt_length.unsqueeze(1))
@@ -91,11 +91,13 @@ def create_args():
     args.add_argument('--save_steps', type=int, default=1000)
     args.add_argument('--mixed_precision', type=str, default="bf16")
     args.add_argument("--log",type=str,default="wandb")
+    args.add_argument("--mask_id",type=int,default=128255)
     return args.parse_args()
 def main():
     args=create_args()
     model, tokenizer, dataloader,accelerator,optimizer=prepare(args)
     global_step=0
+    mask_id =args.mask_id
     progress_bar=tqdm(range(args.num_epochs*len(dataloader)),disable=not accelerator.is_local_main_process)
     for i in range(args.num_epochs):
         for batch in dataloader:
@@ -109,7 +111,7 @@ def main():
             #     random_length = torch.randint(1, input_ids.shape[1] + 1, (1,))
             #     input_ids = input_ids[:, :random_length]
             with accelerator.accumulate(model):
-                loss = compute_loss(input_ids, model,prompt_length)
+                loss = compute_loss(input_ids, model,prompt_length,mask_id)
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
