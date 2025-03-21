@@ -9,6 +9,7 @@ from accelerate.utils import DistributedType, set_seed
 from tqdm import tqdm
 import os
 from gsm8k_data import preprocess_gsm8k
+from generate import generate
 class  TextDataset(Dataset):
     def __init__(self, data_dir, max_length):
         self.examples = []
@@ -33,10 +34,11 @@ def forward_process(input_ids, eps=1e-3,mask_id=126336):
 def compute_loss(input_ids, model,prompt_length,mask_id=128255):
     noisy_batch, masked_indices, p_mask = forward_process(input_ids,mask_id=mask_id)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
+    # print((noisy_batch==mask_id).sum())
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     prompt_mask = (token_positions < prompt_length.unsqueeze(1))
     noisy_batch[prompt_mask] = input_ids[prompt_mask]
-
+    # print((noisy_batch==mask_id).sum())
 # Calculate the answer length (including the padded <EOS> tokens)
     prompt_mask = prompt_mask.to(torch.int64)    
     answer_lengths = torch.sum((1 - prompt_mask), dim=-1, keepdim=True)
@@ -47,6 +49,7 @@ def compute_loss(input_ids, model,prompt_length,mask_id=128255):
     logits = model(input_ids=noisy_batch).logits
     input_ids=input_ids.to(model.device)
     p_mask=p_mask.to(model.device)
+    # print((input_ids[masked_indices]==mask_id).sum())
     token_loss = F.cross_entropy(logits[masked_indices], input_ids[masked_indices], reduction='none') / p_mask[masked_indices]
     answer_lengths=answer_lengths.to(model.device)
     ce_loss = torch.sum(token_loss / answer_lengths[masked_indices]) / input_ids.shape[0]
@@ -74,6 +77,7 @@ def prepare(args):
     config = {
     "num_iterations":args.num_epochs,
     "learning_rate": args.lr,
+    "max_length":args.max_length
 }
 
     accelerator.init_trackers(args.project_name, config=config)
@@ -103,6 +107,15 @@ def create_args():
     args.add_argument("--resume_path",type=str,default=None)
     args.add_argument("--project_name",type=str,default="llada")
     return args.parse_args()
+def eval(model,question,output_dir,tokenizer,mask_id):
+    with torch.no_grad():
+        out= generate(model, question, steps=256, gen_length=256, block_length=256, temperature=0., cfg_scale=0., remasking='low_confidence',mask_id=mask_id)
+        answer = tokenizer.batch_decode(out[:, question.shape[1]:], skip_special_tokens=False)[0]
+        # print(answer)
+        with open(os.path.join(output_dir,"eval.txt"),"w",encoding="utf-8") as f:
+            f.write(answer)
+        # print("txt complete")
+
 def main():
     args=create_args()
     model, tokenizer, dataloader,accelerator,optimizer=prepare(args)
@@ -136,6 +149,10 @@ def main():
                     if global_step%args.save_steps==0:
                         output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                         os.makedirs(output_dir,exist_ok=True)
+                        question="Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
+                        prompt=tokenizer(question)["input_ids"]
+                        prompt = torch.tensor(prompt).to(model.device).unsqueeze(0)
+                        eval(model,prompt,output_dir,tokenizer,mask_id)
             if global_step%args.save_steps==0:
                 output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                 os.makedirs(output_dir,exist_ok=True)
