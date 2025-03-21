@@ -30,7 +30,7 @@ def forward_process(input_ids, eps=1e-3,mask_id=126336):
     # 126336 is used for [MASK] token
     noisy_batch = torch.where(masked_indices, mask_id, input_ids)
     return noisy_batch, masked_indices, p_mask
-def compute_loss(input_ids, model,prompt_length,mask_id=126336):
+def compute_loss(input_ids, model,prompt_length,mask_id=128255):
     noisy_batch, masked_indices, p_mask = forward_process(input_ids,mask_id=mask_id)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     token_positions = torch.arange(noisy_batch.shape[1], device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
@@ -60,15 +60,23 @@ def prepare(args):
     accelerator = Accelerator(
                               log_with=args.log,
                               split_batches=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).to(accelerator.device).train()
+    model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     dataset= preprocess_gsm8k(tokenizer,args.max_length)
+    if args.resume_path is not None:
+        model=AutoModelForCausalLM.from_pretrained(args.resume_path, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,drop_last=True)
     for param in model.parameters():
         param.requires_grad = True
         param.to(torch.float32)
     train_parameters=[param for param in model.parameters() if param.requires_grad]
     optimizer = AdamW(train_parameters, lr=args.lr,)
+    config = {
+    "num_iterations":args.num_epochs,
+    "learning_rate": args.lr,
+}
+
+    accelerator.init_trackers(args.project_name, config=config)
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = (args.batch_size)
     model,optimizer=accelerator.prepare(model,optimizer)
@@ -92,6 +100,8 @@ def create_args():
     args.add_argument('--mixed_precision', type=str, default="bf16")
     args.add_argument("--log",type=str,default="wandb")
     args.add_argument("--mask_id",type=int,default=128255)
+    args.add_argument("--resume_path",type=str,default=None)
+    args.add_argument("--project_name",type=str,default="llada")
     return args.parse_args()
 def main():
     args=create_args()
@@ -121,12 +131,14 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step+=1
+                accelerator.log({"loss":loss},step=global_step)
                 if accelerator.is_main_process:
                     if global_step%args.save_steps==0:
                         output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                         os.makedirs(output_dir,exist_ok=True)
             if global_step%args.save_steps==0:
                 output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
+                os.makedirs(output_dir,exist_ok=True)
                 accelerator.save_state(output_dir)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
