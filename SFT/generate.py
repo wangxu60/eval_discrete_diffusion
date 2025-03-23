@@ -42,7 +42,7 @@ def get_num_transfer_tokens(mask_index, steps):
 
 @ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336):
+             cfg_scale=0., remasking='low_confidence', mask_id=126336,attention_mask=None):
     '''
     Args:
         model: Mask predictor.
@@ -65,7 +65,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 
     assert steps % num_blocks == 0
     steps = steps // num_blocks
-
+    if attention_mask is not None:
+        attention_mask=torch.zeros((x.shape[0],1,x.shape[1],x.shape[1]),dtype=model.dtype,device=model.device)
     for num_block in range(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
@@ -75,11 +76,11 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
-                logits = model(x_).logits
+                logits = model(x_,use_cache=False,attention_mask=attention_mask).logits
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
-                logits = model(x).logits
+                logits = model(x,use_cache=False,attention_mask=attention_mask).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
