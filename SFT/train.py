@@ -1,15 +1,18 @@
 import torch
 from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
-from transformers import AutoModel, AutoTokenizer,AutoModelForCausalLM
+from transformers import AutoModel, AutoTokenizer,AutoModelForCausalLM,LlamaConfig
 import torch.nn.functional as F
 import argparse
 from torch.optim import AdamW
 from accelerate.utils import DistributedType, set_seed
 from tqdm import tqdm
 import os
+import shutil
 from gsm8k_data import preprocess_gsm8k
 from generate import generate
+from models.llama import LlamaModel,LlamaForCausalLM
+os.environ["WANDB_MODE"] = "offline"
 class  TextDataset(Dataset):
     def __init__(self, data_dir, max_length):
         self.examples = []
@@ -20,6 +23,18 @@ class  TextDataset(Dataset):
         return len(self.examples)
     def __getitem__(self, idx):
         return {"text": self.examples[idx]}
+def remove_oldest_folder(directory,checkpoint_num):
+    # 获取所有文件夹的路径
+    folders = [os.path.join(directory, f) for f in os.listdir(directory) if os.path.isdir(os.path.join(directory, f))]
+    if len(folders)<checkpoint_num:
+        return
+    
+    # 按创建时间排序（Windows 使用 `os.path.getctime`，Linux/macOS 使用 `os.path.getmtime`）
+    oldest_folder = min(folders, key=os.path.getctime)
+
+    # 删除最早的文件夹
+    shutil.rmtree(oldest_folder)
+    print(f"已删除最早的文件夹: {oldest_folder}")
     
 def forward_process(input_ids, eps=1e-3,mask_id=126336):
     b, l = input_ids.shape
@@ -31,7 +46,7 @@ def forward_process(input_ids, eps=1e-3,mask_id=126336):
     # 126336 is used for [MASK] token
     noisy_batch = torch.where(masked_indices, mask_id, input_ids)
     return noisy_batch, masked_indices, p_mask
-def compute_loss(input_ids, model,prompt_length,mask_id=128255):
+def compute_loss(input_ids, model,prompt_length,mask_id=128255,attention_mask=None):
     noisy_batch, masked_indices, p_mask = forward_process(input_ids,mask_id=mask_id)
     # temp_tensor = torch.arange(noisy_batch.size(1), device=noisy_batch.device).expand(noisy_batch.size(0), noisy_batch.size(1))
     # print((noisy_batch==mask_id).sum())
@@ -46,7 +61,7 @@ def compute_loss(input_ids, model,prompt_length,mask_id=128255):
 
     masked_indices = (noisy_batch == mask_id)
     noisy_batch=noisy_batch.to(model.device)
-    logits = model(input_ids=noisy_batch).logits
+    logits = model(input_ids=noisy_batch,attention_mask=attention_mask,use_cache=False).logits
     input_ids=input_ids.to(model.device)
     p_mask=p_mask.to(model.device)
     # print((input_ids[masked_indices]==mask_id).sum())
@@ -63,11 +78,14 @@ def prepare(args):
     accelerator = Accelerator(
                               log_with=args.log,
                               split_batches=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
+    os.makedirs(args.output_dir,exist_ok=True)
+    if args.mode==1:
+        model = LlamaForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
+    if args.mode==0:
+        model= AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
+    # model.config._attn_implementation="eager"
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     dataset= preprocess_gsm8k(tokenizer,args.max_length)
-    if args.resume_path is not None:
-        model=AutoModelForCausalLM.from_pretrained(args.resume_path, torch_dtype=torch.bfloat16,trust_remote_code=True).train()
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,drop_last=True)
     for param in model.parameters():
         param.requires_grad = True
@@ -84,6 +102,8 @@ def prepare(args):
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = (args.batch_size)
     model,optimizer=accelerator.prepare(model,optimizer)
+    if args.resume_path is not None:
+        accelerator.load_state(args.resume_path)
     return model, tokenizer, dataloader,accelerator,optimizer
 
 
@@ -106,10 +126,12 @@ def create_args():
     args.add_argument("--mask_id",type=int,default=128255)
     args.add_argument("--resume_path",type=str,default=None)
     args.add_argument("--project_name",type=str,default="llada")
+    args.add_argument("--checkpoint_num",type=int,default=10)
+    args.add_argument("--mode",type=int,default=0)
     return args.parse_args()
-def eval(model,question,output_dir,tokenizer,mask_id):
+def eval(model,question,output_dir,tokenizer,mask_id,attention_mask=None):
     with torch.no_grad():
-        out= generate(model, question, steps=256, gen_length=256, block_length=256, temperature=0., cfg_scale=0., remasking='low_confidence',mask_id=mask_id)
+        out= generate(model, question, steps=1024, gen_length=1024, block_length=1024, temperature=0., cfg_scale=0., remasking='low_confidence',mask_id=mask_id,attention_mask=attention_mask)
         answer = tokenizer.batch_decode(out[:, question.shape[1]:], skip_special_tokens=False)[0]
         # print(answer)
         with open(os.path.join(output_dir,"eval.txt"),"w",encoding="utf-8") as f:
@@ -134,7 +156,12 @@ def main():
             #     random_length = torch.randint(1, input_ids.shape[1] + 1, (1,))
             #     input_ids = input_ids[:, :random_length]
             with accelerator.accumulate(model):
-                loss = compute_loss(input_ids, model,prompt_length,mask_id)
+                if args.mode==1:
+                    attention_mask=torch.zeros((input_ids.shape[0],1,input_ids.shape[1],input_ids.shape[1]),dtype=model.dtype,device=model.device)
+                    loss = compute_loss(input_ids, model,prompt_length,mask_id,attention_mask)
+                else:
+                    attention_mask=None
+                    loss = compute_loss(input_ids, model,prompt_length,mask_id)
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
@@ -147,12 +174,15 @@ def main():
                 accelerator.log({"loss":loss},step=global_step)
                 if accelerator.is_main_process:
                     if global_step%args.save_steps==0:
+
                         output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                         os.makedirs(output_dir,exist_ok=True)
+                        remove_oldest_folder(args.output_dir,checkpoint_num=args.checkpoint_num)
                         question="Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
                         prompt=tokenizer(question)["input_ids"]
                         prompt = torch.tensor(prompt).to(model.device).unsqueeze(0)
-                        eval(model,prompt,output_dir,tokenizer,mask_id)
+                        eval(model,prompt,output_dir,tokenizer,mask_id,attention_mask)
+            accelerator.wait_for_everyone()
             if global_step%args.save_steps==0:
                 output_dir=os.path.join(args.output_dir,f"checkpoint_{global_step}")
                 os.makedirs(output_dir,exist_ok=True)
